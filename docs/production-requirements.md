@@ -2,11 +2,17 @@
 
 ## Business context
 
-Retail IoT platforms distribute customer and operator data across store accounts,
-access-point configuration, electronic shelf label ownership, device telemetry,
-firmware jobs and support diagnostics. Enterprise privacy requests must locate,
-export or erase those records across regions while preserving task receipts and a
-reviewable action history.
+Connected-device vendors receive privacy requests through account closure,
+employee offboarding, customer support and compliance portals. One subject identity
+can appear in the account service, device assignment and ownership metadata,
+telemetry annotations, job-creator history and support tickets. These records are
+owned by different regional services and have different availability and rate limits.
+
+The business needs one request ID that drives every source action, exposes partial
+progress and produces an encrypted export or a deletion receipt with a remaining
+record count for each source. This replaces manual tickets, untracked scripts and
+source-by-source retries with a queryable execution record that customer support and
+compliance teams can review.
 
 ## Service objectives
 

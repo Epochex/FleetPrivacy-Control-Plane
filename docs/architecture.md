@@ -2,17 +2,24 @@
 
 ## Business model
 
-A retailer is the tenant and a store is the resource domain. One user's device-cloud footprint spans five source families:
+A connected-device vendor serves retailers as isolated tenants. A retailer submits a
+privacy request when an account is closed, a former operator requests a data export,
+or its compliance team must delete a subject across regional services. A store is the
+resource domain and the subject's device-cloud footprint spans five source families:
 
 | Source | Connected-device records | Access output | Delete verification |
 | --- | --- | --- | --- |
 | `profile` | account, locale, consent state | selected profile fields | active profile count |
-| `devices` | AP/ESL ownership and pairing | bound-device list | remaining bindings |
-| `telemetry` | heartbeat, battery and health events | subject events | remaining subject events |
-| `jobs` | refresh, blink, firmware and configuration jobs | job history | remaining job rows |
+| `devices` | device ownership, assignment and pairing actor | subject-linked device list | remaining subject bindings |
+| `telemetry` | heartbeat and health events annotated with an operator or account | subject-linked events | remaining subject events |
+| `jobs` | refresh, firmware and configuration jobs with creator identity | subject-created job history | remaining subject job rows |
 | `support_logs` | diagnostics and support cases | matched records | remaining matched logs |
 
-The API accepts one Access or Delete command and creates one independently recoverable task for each selected source. Each task persists tenant, source, owner, lease expiry, attempt, receipt and error. The parent request derives its status and artifact from those receipts.
+The API accepts one Access or Delete command from the customer's privacy portal and
+creates one independently recoverable task for each selected source. Each task
+persists tenant, source, owner, lease expiry, attempt, receipt and error. The parent
+request exposes partial progress and derives the final export or deletion receipt
+from those source results.
 
 ## State ownership
 

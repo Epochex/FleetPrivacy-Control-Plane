@@ -1,8 +1,24 @@
 # FleetPrivacy Control Plane
 
-FleetPrivacy is a Python cloud service that executes privacy access and deletion requests across connected-device data. A retailer tenant can hold one user's data in account profiles, AP/ESL bindings, telemetry, device jobs and support logs. The service turns one API command into five recoverable source tasks, maintains an auditable request state and delivers an encrypted result artifact.
+## 项目解决的问题
 
-The project combines the device onboarding, regional API collection and deployment problems found in large retail IoT estates with a production AWS control plane. Its public capacity envelope follows Hanshow's reported deployment scale of more than 55,000 stores across over 70 countries.
+联网设备厂商为多个企业客户运营设备云。企业客户在员工离职、账号注销或收到数据主体请求时，需要导出或删除某个人的全部关联数据。这些数据分散在账户、设备操作归属、身份关联遥测、任务发起记录和支持工单等区域服务中。逐个系统开工单容易漏项；某个区域执行失败后，人工重跑还可能重复已经完成的删除，最终也缺少一份能够交付给客户的完成证明。
+
+FleetPrivacy 为企业客户的合规门户提供统一后端接口。门户只提交一次人员标识和请求类型，服务便会定位五类数据、分别执行导出或删除，并持续显示每个数据源的进度。访问请求最终生成 KMS 加密的数据包；删除请求返回每个数据源的删除数量、剩余数量和执行回执。Worker 中断、区域接口限流和客户端重复提交都由任务租约、幂等键与持久化回执收敛。
+
+典型流程：零售商关闭一名门店操作员账号并提交删除请求。FleetPrivacy 在同一事务中创建五路任务，区域 Worker 完成删除后反向查询剩余记录。某个 Worker 中途退出时，其余任务在租约到期后由其他 Worker 接管。客户重复提交原请求会取得同一请求编号，已完成数据源保持一次执行。
+
+## Business overview
+
+FleetPrivacy is the backend service behind a connected-device vendor's privacy request portal. Enterprise customers use it when an account is closed, a former employee asks for a copy of personal data, or a compliance team must remove a data subject from every regional system. The same identity can appear in the account profile, device ownership and assignment records, telemetry annotations, job-creator history and support tickets. Handling only the account table leaves linked records behind; retrying a partially completed deletion can repeat side effects and still provide no proof of what was removed.
+
+The API accepts one data-access or deletion request, locates the subject across five data domains, executes each source action independently and returns either an encrypted export or a source-by-source deletion receipt. The caller can see which sources completed, which source is retrying and whether a reverse query found remaining records. Every state change is retained in a tenant audit chain for customer support and compliance review.
+
+### Example business flow
+
+A retailer closes a store-operator account and submits one Delete request with its tenant ID, subject ID and idempotency key. FleetPrivacy creates five source tasks in the same database transaction, sends them to regional workers and limits each upstream service according to its observed capacity. If a worker exits after three sources finish, another worker reclaims the remaining leases. The completed request reports the deleted and remaining record counts for every source. Repeating the original HTTP request returns the same request ID and performs zero additional source actions.
+
+This gives the device-cloud team one accountable path for account closure, data-subject access requests and deletion requests across regional services. The project combines device onboarding, regional API collection and deployment problems found in large retail IoT estates with an AWS control plane. Its capacity model follows Hanshow's reported deployment scale of more than 55,000 stores across over 70 countries.
 
 ## Production path
 
