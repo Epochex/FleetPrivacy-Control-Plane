@@ -1,123 +1,91 @@
 # FleetPrivacy Control Plane
 
-FleetPrivacy is a Python cloud service for executing privacy access and erasure
-requests across connected-device data. A single user can leave records in the
-account service, device registry, telemetry stream, print-job history and
-support logs. The control plane turns one privacy request into independently
-recoverable source tasks, records every transition and returns a verifiable
-result.
+FleetPrivacy is a Python cloud service that executes privacy access and deletion requests across connected-device data. A retailer tenant can hold one user's data in account profiles, AP/ESL bindings, telemetry, device jobs and support logs. The service turns one API command into five recoverable source tasks, maintains an auditable request state and delivers an encrypted result artifact.
 
-The project models a practical device-cloud problem: a privacy operation must
-finish across several stores even when a worker crashes, a client retries the
-same HTTP call or one source is temporarily unavailable.
+The project combines the device onboarding, regional API collection and deployment problems found in large retail IoT estates with a production AWS control plane. Its public capacity envelope follows Hanshow's reported deployment scale of more than 55,000 stores across over 70 countries.
 
-## What it demonstrates
-
-- **Python cloud API:** FastAPI, Pydantic validation, async SQLAlchemy and
-  PostgreSQL-backed request state.
-- **Idempotent request intake:** `(tenant_id, idempotency_key)` uniqueness makes
-  client retries return the original request.
-- **Multi-tenant isolation:** tenant identity is carried from authentication to
-  every request, task, record, audit event and query predicate.
-- **Recoverable background work:** one task per data source, expiring leases,
-  persisted attempts and aggregate request states.
-- **Transactional event handoff:** request state and outbox records are
-  committed together for a reliable downstream publisher.
-- **Tamper-evident audit:** each audit entry hashes the previous entry, action
-  and payload so a verifier can detect mutation or deletion.
-- **Data minimization:** the service persists a normalized SHA-256 subject key;
-  raw account identifiers stay outside the request tables and logs.
-- **Operations:** Prometheus counters and latency histograms, container health
-  checks, Docker Compose and a Kubernetes deployment manifest.
-
-## Request lifecycle
-
-```mermaid
-stateDiagram-v2
-    [*] --> queued: POST request
-    queued --> running: source tasks claimed
-    running --> verifying: deletion readback
-    running --> completed: access sources succeeded
-    running --> partial: mixed source results
-    verifying --> completed: deletion sources verified
-    verifying --> partial: mixed source results
-    running --> failed: request cannot make progress
-    completed --> [*]
-    partial --> [*]
-    failed --> [*]
-```
-
-An access request collects matching records into an artifact. An erasure
-request marks matching records deleted and verifies each source result. Task
-receipts remain queryable after completion, which makes partial outcomes and
-retry history visible to operators.
-
-## Architecture
+## Production path
 
 ```mermaid
 flowchart LR
-    C[Cloud client] -->|tenant, API key, idempotency key| A[FastAPI service]
-    A --> V[Pydantic validation]
-    V --> P[(PostgreSQL)]
-    P --> R[Privacy requests]
-    P --> T[Source tasks and leases]
-    P --> O[Outbox events]
-    P --> U[Hash-chained audit]
-    W[Task worker] -->|claim and checkpoint| T
-    W --> D[Device-cloud source adapters]
-    D -->|receipt and verification| W
-    W --> F[Access artifacts]
-    A --> M[Prometheus metrics]
+    C[Retailer cloud client] -->|tenant, API key, idempotency key| A[FastAPI on EKS]
+    A --> P[(RDS PostgreSQL Multi-AZ)]
+    P --> R[Request state and task leases]
+    P --> O[Transactional Outbox]
+    P --> U[Tenant audit chain]
+    O --> Q[SQS and DLQ]
+    Q --> W[EKS task workers]
+    W --> X[Regional device-cloud APIs]
+    W <--> E[ElastiCache Redis AIMD windows]
+    W --> S[S3 SSE-KMS artifacts]
+    A -->|300 s presigned GET| S
+    M[CloudWatch] --> A
+    M --> W
 ```
 
-PostgreSQL is both the system of record and the task coordination primitive.
-This keeps the local stack small while still exercising transaction design,
-concurrent claims and crash recovery. See [architecture.md](docs/architecture.md)
-for the state transitions and invariants.
+Each service owns one concrete state:
+
+- **RDS PostgreSQL:** requests, tenant-scoped idempotency keys, task owner/lease/attempt, Outbox rows, source receipts and the audit-chain head.
+- **SQS:** committed task wake-up events, visibility deadlines, receive counts and DLQ transfer after repeated failure.
+- **ElastiCache Redis:** one atomic AIMD concurrency window per tenant and regional source, updated through Lua with TTL.
+- **S3 and KMS:** versioned Access JSON artifacts, SSE-KMS encryption and SHA-256 object metadata.
+- **EKS:** separately scaled API and worker deployments, Pod Identity, probes, disruption budgets and rolling replacement.
+- **CloudWatch:** RDS pressure, Redis eviction/CPU, SQS queue age and DLQ alarms with direct operator actions.
+
+The Terraform stack creates a three-AZ VPC, private EKS nodes, RDS PostgreSQL 16 Multi-AZ, Redis with one primary and two replicas, SQS/DLQ, encrypted S3, KMS, Secrets Manager and workload-specific IAM. The Helm chart separates API and worker service accounts and mounts secrets through the AWS CSI provider.
+
+## Request and recovery contract
+
+1. FastAPI validates tenant, command and `Idempotency-Key`.
+2. One PostgreSQL transaction inserts the request, five source tasks, one `privacy_task.ready` Outbox event per task and the first audit event.
+3. Parallel relays use `FOR UPDATE SKIP LOCKED`; a row receives `published_at` only after SQS confirms the send.
+4. A worker claims the database task by `task_id`, persists owner, lease and attempt, and extends both SQS visibility and the database lease while processing.
+5. Regional connectors use HTTPS and a Secrets Manager service token, then send tenant, request and task idempotency headers. Redis stores the shared tenant/source AIMD window so multiple worker Pods converge on the same upstream capacity.
+6. Access aggregates source receipts into an S3 object. Delete performs tenant-scoped mutation followed by a reverse query for remaining active rows.
+7. The API returns a five-minute presigned S3 URL. Every request and task transition is appended to the per-tenant audit chain.
+
+The database task row absorbs SQS duplicate delivery. A relay exit after SQS send produces another wake-up event and zero additional execution for a terminal task. A worker exit leaves both message visibility and database lease to expire; another worker reclaims the same task. If an Access task commits before its S3 artifact is recorded, the repeated message rebuilds the deterministic object without incrementing the task attempt.
+
+Regional HTTP failures reset the task to `pending` for the first four attempts and leave the SQS message unacknowledged. The fifth failure persists a terminal receipt; SQS moves the repeatedly delivered message to the DLQ under the configured redrive policy.
+
+## Implemented engineering mechanisms
+
+- FastAPI, Pydantic, async SQLAlchemy and explicit PostgreSQL connection-pool sizing.
+- `(tenant_id, idempotency_key)` uniqueness plus request-body equivalence checks.
+- `FOR UPDATE SKIP LOCKED` task claims and Outbox relay.
+- SQS long polling, visibility heartbeat, successful-only acknowledgement and DLQ infrastructure.
+- S3 `PutObject` with SSE-KMS, SHA-256 metadata and short-lived presigned GET.
+- Redis Lua updates for tenant/source AIMD state and an expiring sorted-set admission lease, plus measured 429-driven multiplicative decrease.
+- Tenant ID in request, task, record, Outbox, audit and every resource lookup predicate.
+- Per-tenant audit sequence, previous hash, payload hash and advisory transaction lock.
+- Terraform, Helm, Docker/LocalStack, readiness/liveness probes, HPA, PDB, CloudWatch alarms and CI.
+
+## Measured results
+
+The committed PostgreSQL 16 workload used 100 tenants, 50 concurrent clients, 1,000 requests and 5,000 source tasks:
+
+| Result | Measurement |
+| --- | ---: |
+| request admission | 63.03 requests/s |
+| create latency | P50 715.5 ms, P95 1,272.3 ms, P99 1,655.1 ms |
+| source-task processing | 31.78 tasks/s |
+| completed requests | 1,000 / 1,000 |
+| idempotent replays returning original ID | 1,000 / 1,000 |
+| additional task attempts after replay | 0 |
+| audit chains passing full recomputation | 100 / 100 |
+
+Additional committed experiments:
+
+- **Worker termination:** all five leased tasks were reclaimed after expiry, completed on attempt 2 and added zero attempts on idempotent replay.
+- **Tenant isolation:** 10,000 cross-tenant resource probes returned 10,000 HTTP 404 responses; all 100 same-tenant controls returned HTTP 200.
+- **AWS adapters:** LocalStack/Redis processed and acknowledged 500 SQS messages with zero queue residue, stored 100/100 S3 objects with SSE-KMS and SHA-256 metadata, and completed 1,000 atomic Redis window updates.
+- **Connector overload:** with source capacity 8, fixed concurrency 32 produced 988 first-attempt HTTP 429 responses across 1,000 operations; AIMD produced 25, a 97.47% reduction, and raised accepted throughput from 28.53 to 432.11 operations/s.
+
+Machine-readable results are stored in [`benchmarks/benchmark_results`](benchmarks/benchmark_results). The workload definitions and interpretation are in [benchmark.md](docs/benchmark.md).
 
 ## Quick start
 
-### Docker Compose
-
-```bash
-git clone https://github.com/Epochex/FleetPrivacy-Control-Plane.git
-cd FleetPrivacy-Control-Plane
-export POSTGRES_PASSWORD="$(python -c 'import secrets; print(secrets.token_urlsafe(24))')"
-export PRIVACY_CLOUD_API_KEY="local-demo-key"
-docker compose up --build -d
-curl http://localhost:8000/v1/healthz
-```
-
-Create sample device-cloud records, submit an access request and execute its
-source tasks:
-
-```bash
-export API=http://localhost:8000
-export TENANT=maker-lab
-export SUBJECT=owner@example.com
-
-curl -sS -X POST "$API/v1/admin/seed" \
-  -H "X-Tenant-ID: $TENANT" \
-  -H "X-API-Key: $PRIVACY_CLOUD_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d "{\"subject_key\":\"$SUBJECT\",\"records_per_source\":3}"
-
-curl -sS -X POST "$API/v1/privacy-requests" \
-  -H "X-Tenant-ID: $TENANT" \
-  -H "X-API-Key: $PRIVACY_CLOUD_API_KEY" \
-  -H "Idempotency-Key: access-owner-001" \
-  -H "Content-Type: application/json" \
-  -d "{\"subject_key\":\"$SUBJECT\",\"kind\":\"access\",\"sources\":[\"profile\",\"devices\",\"telemetry\",\"jobs\",\"support_logs\"]}"
-
-curl -sS -X POST "$API/v1/admin/process-once?worker_id=demo-worker&batch_size=32" \
-  -H "X-Tenant-ID: $TENANT" \
-  -H "X-API-Key: $PRIVACY_CLOUD_API_KEY"
-```
-
-OpenAPI documentation is available at `http://localhost:8000/docs`. The full
-route guide is in [api.md](docs/api.md).
-
-### Local Python
+### Local application
 
 ```bash
 python -m venv .venv
@@ -127,48 +95,44 @@ uvicorn privacy_cloud.main:app --reload
 pytest -q
 ```
 
-SQLite is the local default. PostgreSQL is used for the container stack and the
-concurrent-worker benchmark.
+SQLite and local artifact files are the default adapters for a short development loop.
 
-## Benchmark
-
-The committed PostgreSQL benchmark admitted **200 requests at 65.47 req/s** and
-processed **1,000 source tasks at 67.47 tasks/s**. All 200 requests completed.
-A second pass replayed every idempotency key: all 200 request IDs matched and
-task attempts stayed at 1,000. Audit verification passed for all 20 tenants.
-
-Run the same workload with:
+### AWS-compatible integration stack
 
 ```bash
-python benchmarks/run_benchmark.py \
-  --database-url postgresql+asyncpg://privacy:privacy@127.0.0.1:55432/privacy \
-  --requests 200 --concurrency 20 --tenants 20 \
-  --records-per-source 4 --worker-batch-size 64
+docker compose -f compose.aws-test.yml up --build -d
+curl http://localhost:8000/v1/healthz
+python benchmarks/run_aws_adapter_integration.py
 ```
 
-Reproduction parameters, percentiles and measurement scope are published in
-[benchmark.md](docs/benchmark.md). The machine-readable result is committed at
-[`benchmark-20260813T220057Z.json`](benchmarks/benchmark_results/benchmark-20260813T220057Z.json).
+The stack starts PostgreSQL 16, Redis 7, LocalStack SQS/S3/KMS, the API and the queue worker. LocalStack creates the primary queue, DLQ, redrive policy, KMS alias, encrypted S3 bucket and public-access block.
+
+### AWS deployment
+
+```bash
+cd infra/aws
+cp backend.hcl.example backend.hcl
+cp terraform.tfvars.example terraform.tfvars
+terraform init -backend-config=backend.hcl
+terraform validate
+terraform plan -out=production.tfplan
+terraform apply production.tfplan
+```
+
+Deployment topology, service responsibility, IAM and failure drills are documented in [aws-production.md](docs/aws-production.md).
 
 ## Repository guide
 
 ```text
-src/privacy_cloud/   API, database models, security and task execution
-tests/               state, idempotency, tenant and failure-recovery tests
-benchmarks/          repeatable load generator and result artifacts
-deploy/              Compose and Kubernetes deployment notes
-docs/                architecture, API, benchmark and interview deep dives
+src/privacy_cloud/       API, state machine, AWS adapters and source connectors
+tests/                   idempotency, tenant, recovery, SQS/S3 and AIMD tests
+benchmarks/              load, fault, isolation, connector and AWS integration runs
+infra/aws/               three-AZ AWS Terraform
+deploy/aws/              API/worker Helm chart
+deploy/localstack/       local AWS resource bootstrap
+docs/                    architecture, benchmark and interview deep dives
 ```
 
 ## Engineering references
 
-FleetPrivacy combines patterns proven in several public systems:
-
-- [Full Stack FastAPI Template](https://github.com/fastapi/full-stack-fastapi-template)
-  for Python API, PostgreSQL, container and CI conventions.
-- [Fides](https://github.com/ethyca/fides) for data-subject request orchestration
-  and privacy-request operational workflows.
-- [Amazon S3 Find and Forget](https://github.com/awslabs/amazon-s3-find-and-forget)
-  for queued discovery, deletion jobs and auditable action logs.
-Attribution and license details are recorded in [NOTICE](NOTICE). FleetPrivacy
-is released under the [MIT License](LICENSE).
+FleetPrivacy combines patterns from [Full Stack FastAPI Template](https://github.com/fastapi/full-stack-fastapi-template), [Fides](https://github.com/ethyca/fides) and [Amazon S3 Find and Forget](https://github.com/awslabs/amazon-s3-find-and-forget). Attribution and license details are recorded in [NOTICE](NOTICE). FleetPrivacy is released under the [MIT License](LICENSE).

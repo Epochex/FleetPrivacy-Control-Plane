@@ -151,6 +151,7 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         terminal: set[str] = set()
         processing_started = time.perf_counter()
         passes = 0
+        worker_semaphore = asyncio.Semaphore(args.worker_concurrency)
         while len(terminal) < len(request_ids):
             passes += 1
             if passes > args.max_processing_passes:
@@ -161,9 +162,10 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
 
             async def process_tenant(tenant_index: int) -> None:
                 headers = headers_for(tenant_index)
-                elapsed, response = await timed(
-                    lambda: client.post("/v1/admin/process-once", headers=headers)
-                )
+                async with worker_semaphore:
+                    elapsed, response = await timed(
+                        lambda: client.post("/v1/admin/process-once", headers=headers)
+                    )
                 response.raise_for_status()
                 process_latencies.append(elapsed)
 
@@ -263,6 +265,7 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
             "create_concurrency": args.concurrency,
             "tenants": args.tenants,
             "worker_batch_size": args.worker_batch_size,
+            "worker_concurrency": args.worker_concurrency,
             "request_mix": "50% access, 50% delete",
         },
         "seed": {
@@ -307,6 +310,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tenants", type=int, default=20)
     parser.add_argument("--records-per-source", type=int, default=4)
     parser.add_argument("--worker-batch-size", type=int, default=64)
+    parser.add_argument("--worker-concurrency", type=int, default=10)
     parser.add_argument("--poll-every", type=int, default=1)
     parser.add_argument("--max-processing-passes", type=int, default=2000)
     parser.add_argument(
@@ -329,6 +333,7 @@ def main() -> int:
         "tenants",
         "records_per_source",
         "worker_batch_size",
+        "worker_concurrency",
     ):
         if getattr(args, name) < 1:
             raise SystemExit(f"--{name.replace('_', '-')} must be positive")

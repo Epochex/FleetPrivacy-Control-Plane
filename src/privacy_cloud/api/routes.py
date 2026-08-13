@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response, status
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -14,6 +14,7 @@ from privacy_cloud.db import get_session
 from privacy_cloud.models import PrivacyRequest, RequestStatus
 from privacy_cloud.schemas import PrivacyRequestCreate, PrivacyRequestView, SeedRecordsRequest
 from privacy_cloud.security import tenant_context
+from privacy_cloud.services.artifacts import build_artifact_store
 from privacy_cloud.services.events import unpublished_outbox_count, verify_audit_chain
 from privacy_cloud.services.records import seed_records
 from privacy_cloud.services.requests import (
@@ -76,14 +77,27 @@ async def get_request(request_id: str, session: Session, tenant_id: Tenant) -> P
 
 
 @router.get("/privacy-requests/{request_id}/artifact")
-async def download_artifact(request_id: str, session: Session, tenant_id: Tenant) -> FileResponse:
+async def download_artifact(
+    request_id: str,
+    session: Session,
+    tenant_id: Tenant,
+) -> Response:
     request = await get_privacy_request(session, tenant_id=tenant_id, request_id=request_id)
     if request is None:
         raise HTTPException(status_code=404, detail="privacy request not found")
     if not request.artifact_path:
         raise HTTPException(status_code=409, detail="artifact is not ready")
+    settings = get_settings()
+    if request.artifact_path.startswith("s3://"):
+        signed_url = await build_artifact_store(settings).presign_get(
+            request.artifact_path,
+            settings.artifact_presign_seconds,
+        )
+        if signed_url is None:
+            raise HTTPException(status_code=404, detail="artifact object not found")
+        return RedirectResponse(signed_url, status_code=307)
     path = Path(request.artifact_path).resolve()
-    artifact_root = Path(get_settings().artifact_dir).resolve()
+    artifact_root = Path(settings.artifact_dir).resolve()
     if artifact_root not in path.parents or not path.is_file():
         raise HTTPException(status_code=404, detail="artifact file not found")
     return FileResponse(path, media_type="application/json", filename=f"{request_id}.json")

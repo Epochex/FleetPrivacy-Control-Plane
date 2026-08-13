@@ -1,0 +1,30 @@
+image: ghcr.io/epochex/fleetprivacy-control-plane:latest
+replicas: 3
+workerReplicas: 3
+
+aws:
+  region: eu-west-1
+  queueUrl: ""
+  bucket: ""
+  secretArn: ""
+  kmsKeyArn: ""
+  regionalSourceBaseUrl: "https://regional-device-cloud.internal"
+
+service:
+  internal: true
+
+resources:
+  api:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+  worker:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: "2"
+      memory: 1Gi

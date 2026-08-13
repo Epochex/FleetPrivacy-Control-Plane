@@ -1,0 +1,15 @@
+.git
+.github
+.pytest_cache
+.ruff_cache
+.venv
+**/__pycache__
+**/*.pyc
+infra/aws/.terraform
+infra/aws/backend.hcl
+infra/aws/terraform.tfvars
+artifacts
+benchmarks
+docs
+tests
+*.db

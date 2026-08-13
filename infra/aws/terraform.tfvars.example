@@ -1,0 +1,13 @@
+aws_region      = "eu-west-1"
+name            = "fleetprivacy-prod"
+container_image = "ghcr.io/epochex/fleetprivacy-control-plane@sha256:replace-with-release-digest"
+regional_source_base_url = "https://regional-device-cloud.internal"
+
+alarm_topic_arns = [
+  "arn:aws:sns:eu-west-1:123456789012:platform-oncall"
+]
+
+tags = {
+  Owner      = "cloud-platform"
+  CostCenter = "privacy"
+}

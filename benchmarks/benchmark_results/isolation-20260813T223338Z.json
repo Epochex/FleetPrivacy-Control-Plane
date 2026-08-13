@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "timestamp_utc": "2026-08-13T22:33:38.383962+00:00",
+  "workload": {
+    "tenants": 100,
+    "cross_tenant_probes": 10000,
+    "concurrency": 25,
+    "database": "PostgreSQL (asyncpg)",
+    "transport": "HTTPX ASGITransport"
+  },
+  "result": {
+    "cross_tenant_404": 10000,
+    "cross_tenant_other": 0,
+    "own_tenant_200": 100,
+    "own_tenant_total": 100,
+    "wall_seconds": 39.9691,
+    "probes_per_second": 250.19
+  }
+}

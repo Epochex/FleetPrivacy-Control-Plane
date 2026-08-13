@@ -1,80 +1,79 @@
 # Architecture
 
-## Business flow
+## Business model
 
-Connected-device platforms usually distribute one person's information across
-several domains:
+A retailer is the tenant and a store is the resource domain. One user's device-cloud footprint spans five source families:
 
-| Source | Example records | Access action | Erasure action |
+| Source | Connected-device records | Access output | Delete verification |
 | --- | --- | --- | --- |
-| `profile` | account and locale | export matching fields | remove profile payload |
-| `devices` | ownership and pairing | export owned devices | remove ownership records |
-| `telemetry` | health and usage events | export subject events | remove subject events |
-| `jobs` | print or device jobs | export job history | remove job records |
-| `support_logs` | support diagnostics | export matching logs | remove subject logs |
+| `profile` | account, locale, consent state | selected profile fields | active profile count |
+| `devices` | AP/ESL ownership and pairing | bound-device list | remaining bindings |
+| `telemetry` | heartbeat, battery and health events | subject events | remaining subject events |
+| `jobs` | refresh, blink, firmware and configuration jobs | job history | remaining job rows |
+| `support_logs` | diagnostics and support cases | matched records | remaining matched logs |
 
-The API accepts one access or deletion command and expands it into one task for
-each requested source. Each task stores its own attempt counter, lease, result
-summary and error. The parent request derives its state from those receipts.
+The API accepts one Access or Delete command and creates one independently recoverable task for each selected source. Each task persists tenant, source, owner, lease expiry, attempt, receipt and error. The parent request derives its status and artifact from those receipts.
 
-## Write path
+## State ownership
 
-Request creation uses one database transaction:
+| Component | Input | Maintained state | Output |
+| --- | --- | --- | --- |
+| FastAPI | tenant, API key, idempotency key, request command | validated request context | stable request ID and query API |
+| RDS PostgreSQL | request command, claims and receipts | request state, leases, attempts, Outbox, source records and audit chain | atomic state transitions |
+| SQS | committed Outbox envelopes | visibility deadline, receive count and DLQ status | worker wake-up event |
+| Worker | SQS event and database task | in-progress lease heartbeat | source receipt and parent-state update |
+| Redis | source latency, HTTP 429 and failures | tenant/source AIMD window with TTL | next connector concurrency limit |
+| S3/KMS | Access JSON bytes | encrypted versioned object and SHA-256 metadata | five-minute presigned download |
 
-1. Authenticate `X-API-Key` and validate `X-Tenant-ID`.
-2. Normalize and hash the subject key.
-3. insert the privacy request under the tenant-scoped idempotency key.
-4. Insert one task for each selected source.
-5. Append the first audit event.
-6. Insert the outbox event.
-7. Commit all records together.
+## Transactional request intake
 
-The unique constraint on `(tenant_id, idempotency_key)` is the final arbiter for
-concurrent duplicate submissions. After a conflict, the API reads and returns
-the existing aggregate.
+One PostgreSQL transaction performs this sequence:
 
-## Task claiming and recovery
+1. Hash the normalized subject identity.
+2. Insert the request under `(tenant_id, idempotency_key)`.
+3. Insert one task per selected source.
+4. Insert one `privacy_task.ready` Outbox row per task and one request-created event.
+5. Append the first tenant audit event.
+6. Commit all rows.
 
-Workers claim pending tasks in batches. A claim writes `lease_owner`,
-`lease_expires_at`, increments `attempt` and moves the task to `running`.
-PostgreSQL row locking prevents two workers from owning the same task at the
-same time. A task whose lease expires becomes claimable again, so process loss
-does not strand the parent request.
+Concurrent requests using the same tenant and idempotency key converge through the unique constraint. A replay with the same normalized command returns the original request. A key reused for a different command returns HTTP 409.
 
-The source action is idempotent for a `(request_id, source)` pair. The worker
-stores a compact receipt after each source call and then recalculates the parent
-request state:
+## Outbox and SQS delivery
 
-- pending or active tasks produce `running`;
-- successful access tasks produce `completed`;
-- deletion execution sets `verifying` while it performs the source readback,
-  then successful tasks produce `completed`;
-- mixed success and failure produce `partial`;
-- terminal failure across the request produces `failed`.
+Relays scan committed Outbox rows with `FOR UPDATE SKIP LOCKED`. The relay sends an envelope containing event ID, tenant ID, aggregate ID, event type and payload, then records `published_at`. A process exit between send confirmation and the database update creates a duplicate SQS event. The consumer uses the database task row as the execution gate:
 
-## Data model
+```text
+pending task + valid message       -> claim, attempt + 1, execute
+running task + active lease        -> leave message unacknowledged
+running task + expired lease       -> reclaim, attempt + 1, execute
+succeeded or failed task           -> refresh aggregate/artifact, acknowledge
+unknown task                       -> acknowledge
+```
 
-### `privacy_requests`
+During source work, a heartbeat extends SQS visibility and the PostgreSQL task lease. Successful processing deletes the SQS message. An exception leaves the message available for redelivery; the fifth receive moves it to the DLQ.
 
-The aggregate stores tenant, idempotency key, hashed subject, request kind,
-policy version, selected sources, artifact location, status and an optimistic
-version. The tenant/status/creation index supports dashboards and polling.
+## Regional source control
 
-### `request_tasks`
+Each connector operation uses HTTPS with a Secrets Manager service token and carries `X-Tenant-ID`, `X-Request-ID`, a task/source idempotency key and the hashed subject. The AIMD controller records response latency and success for a homogeneous tenant/source batch:
 
-One row represents one source action. `(request_id, source)` is unique. The
-claim index covers status, lease expiry and creation time so workers can find
-available work without scanning completed history.
+```text
+healthy window and P95 <= target: window = min(maximum, window + 1)
+HTTP failure or P95 > target:      window = max(minimum, floor(window * ratio))
+```
 
-### `outbox_events`
+Redis stores the window under `privacy:aimd:{tenant}:{source}` and active holders in a sorted set whose score is the admission-lease expiry. One Lua script removes expired holders, compares cardinality with the current window and admits a new task atomically. A second Lua script reads the current window, computes the next value and refreshes the TTL atomically, so all worker Pods observe and enforce the same upstream-pressure decision.
 
-An outbox event is inserted beside the state change it describes. A publisher
-can deliver unpublished events and then set `published_at`. This closes the
-gap between committing request state and notifying another service.
+## Access and Delete completion
 
-### `audit_events`
+Access aggregates source receipts into canonical JSON. S3 stores the object under `artifacts/{tenant_id}/{request_id}.json` with SSE-KMS and SHA-256 metadata. The API returns a presigned GET URL valid for 300 seconds.
 
-Audit entries form a per-request hash chain:
+Delete scopes every mutation by tenant, subject hash and source, then queries the same predicate for active rows. A nonzero remaining count records a failed receipt. Completed and failed source receipts remain attached to the parent request for repair and replay.
+
+An Access task can commit immediately before S3 upload or request aggregation. A duplicate SQS message sees the terminal task, rebuilds a missing artifact at the deterministic S3 key, refreshes the parent request and acknowledges the event without increasing the task attempt.
+
+## Audit chain
+
+Each tenant owns a monotonic sequence. PostgreSQL advisory transaction locks serialize chain-head updates. An event stores the previous hash, canonical payload hash and current event hash:
 
 ```text
 payload_hash = SHA256(canonical_json(payload))
@@ -83,46 +82,10 @@ event_hash = SHA256(canonical_json(
 ))
 ```
 
-Sequence and previous-hash validation detects edited, reordered and interior
-deleted entries. An externally stored chain head also detects tail deletion.
-Audit payloads contain identifiers and receipts needed for review; raw subject
-keys stay out of the chain.
+The unique `(tenant_id, sequence)` constraint blocks concurrent forks. Full recomputation detects payload mutation, reordering and interior deletion.
 
-### `device_cloud_records`
+## AWS topology
 
-This table provides reproducible device-cloud source adapters for the demo and
-benchmark. Every record carries tenant, hashed subject and source. Erasure sets
-`deleted_at`; access collects active payloads into the request artifact.
+Terraform provisions three availability zones, private EKS nodes, RDS PostgreSQL Multi-AZ, ElastiCache Redis with automatic failover, SQS/DLQ, S3/KMS, Secrets Manager and CloudWatch. API and worker Pods use separate Pod Identity roles. The Helm chart configures rolling deployments, health probes, topology spread, HPA and PDB.
 
-## Multi-tenant isolation
-
-Tenant identity is established from the request header after API-key checking.
-Every aggregate and source row stores `tenant_id`, and every read or mutation
-uses it as a predicate. Idempotency keys are tenant-local, so two customers can
-use the same client-generated key without collision.
-
-Tests exercise cross-tenant request lookup, repeated idempotency keys and data
-records that share the same subject hash in different tenants.
-
-## Failure matrix
-
-| Failure | Persisted evidence | Recovery action |
-| --- | --- | --- |
-| client times out after commit | request and idempotency row | retry returns the same request |
-| process exits after task claim | owner and lease expiry | another worker reclaims after expiry |
-| one source fails | attempt, error and sibling receipts | return partial or failed with the successful receipts intact |
-| callback delivery fails | unpublished outbox row | publisher retries from database |
-| audit record is changed | broken hash or sequence | verifier identifies first invalid event |
-
-## Operations
-
-The service exposes created/completed counters and a source/kind task-duration
-histogram. Operators can derive request completion rate, source error rate and
-latency distributions from these metrics. Health probes cover API process
-availability; deployment monitoring should add database connectivity and lease
-backlog alerts.
-
-The first scaling step is multiple API processes sharing PostgreSQL. Worker
-throughput scales through batch size and concurrent claimers. Artifact storage
-can move from the mounted volume to an object-store adapter while keeping the
-request state and signed location in PostgreSQL.
+The exact resource graph, IAM actions, alarms and failure drills are defined in [aws-production.md](aws-production.md).

@@ -1,0 +1,84 @@
+name: fleetprivacy-aws-test
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: fleetprivacy
+      POSTGRES_USER: fleetprivacy
+      POSTGRES_PASSWORD: fleetprivacy-test
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fleetprivacy -d fleetprivacy"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  localstack:
+    image: localstack/localstack:3.8
+    environment:
+      SERVICES: s3,sqs,kms
+      AWS_DEFAULT_REGION: eu-west-1
+      EAGER_SERVICE_LOADING: "1"
+    ports:
+      - "4566:4566"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:4566/_localstack/health | grep -q available"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - ./deploy/localstack/init:/etc/localstack/init/ready.d:ro
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "127.0.0.1:16379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment: &application-environment
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: eu-west-1
+      PRIVACY_CLOUD_DATABASE_URL: postgresql+asyncpg://fleetprivacy:fleetprivacy-test@postgres:5432/fleetprivacy
+      PRIVACY_CLOUD_API_KEY: localstack-test-key
+      PRIVACY_CLOUD_QUEUE_BACKEND: sqs
+      PRIVACY_CLOUD_ARTIFACT_BACKEND: s3
+      PRIVACY_CLOUD_AWS_REGION: eu-west-1
+      PRIVACY_CLOUD_AWS_ENDPOINT_URL: http://localstack:4566
+      PRIVACY_CLOUD_SQS_QUEUE_URL: http://localstack:4566/000000000000/fleetprivacy-requests
+      PRIVACY_CLOUD_SQS_VISIBILITY_TIMEOUT_SECONDS: 60
+      PRIVACY_CLOUD_SQS_HEARTBEAT_SECONDS: 20
+      PRIVACY_CLOUD_S3_BUCKET: fleetprivacy-artifacts
+      PRIVACY_CLOUD_S3_PREFIX: artifacts
+      PRIVACY_CLOUD_S3_KMS_KEY_ID: alias/fleetprivacy-data
+      PRIVACY_CLOUD_REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python", "-m", "privacy_cloud.services.queue_worker"]
+    environment: *application-environment
+    depends_on:
+      app:
+        condition: service_started
+      localstack:
+        condition: service_healthy

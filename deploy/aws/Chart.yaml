@@ -1,0 +1,6 @@
+apiVersion: v2
+name: fleetprivacy
+description: FleetPrivacy API and SQS task workers on EKS
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

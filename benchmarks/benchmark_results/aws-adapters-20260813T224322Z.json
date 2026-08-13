@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "timestamp_utc": "2026-08-13T22:43:22.915353+00:00",
+  "environment": {
+    "aws_endpoint": "http://127.0.0.1:4566",
+    "redis_endpoint": "redis://127.0.0.1:16379/0",
+    "region": "eu-west-1"
+  },
+  "sqs": {
+    "published": 500,
+    "received_and_acknowledged": 500,
+    "publish_per_second": 202.94,
+    "consume_per_second": 146.46,
+    "maximum_receive_count": 1,
+    "visible_after": 0,
+    "in_flight_after": 0,
+    "visibility_heartbeat_exercised": true
+  },
+  "s3_kms": {
+    "uploaded": 100,
+    "uploads_per_second": 119.68,
+    "all_sse_kms": true,
+    "all_sha256_metadata": true,
+    "presigned_get_seconds": 300,
+    "presigned_url_generated": true
+  },
+  "redis_aimd": {
+    "atomic_updates": 1000,
+    "first_transition": [
+      4,
+      5
+    ],
+    "last_transition": [
+      64,
+      64
+    ],
+    "updates_per_second": 960.32,
+    "tenant_source_key": "privacy:aimd:tenant-a:telemetry",
+    "admitted_at_window_64": 64,
+    "sixty_fifth_blocked": true,
+    "readmitted_after_release": true
+  }
+}

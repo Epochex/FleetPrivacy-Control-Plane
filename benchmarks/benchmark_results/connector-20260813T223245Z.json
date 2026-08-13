@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "timestamp_utc": "2026-08-13T22:32:45.649597+00:00",
+  "workload": {
+    "operations": 1000,
+    "source_capacity": 8,
+    "service_ms": 10,
+    "fixed_concurrency": 32,
+    "adaptive_initial_concurrency": 4,
+    "adaptive_target_p95_ms": 30
+  },
+  "fixed": {
+    "accepted": 12,
+    "rejected_429": 988,
+    "peak_in_flight": 32,
+    "wall_seconds": 0.4206,
+    "attempts_per_second": 2377.8,
+    "accepted_per_second": 28.53,
+    "mean_end_to_end_ms": 195.039
+  },
+  "aimd": {
+    "accepted": 975,
+    "rejected_429": 25,
+    "peak_in_flight": 9,
+    "final_concurrency": 9,
+    "wall_seconds": 2.2563,
+    "attempts_per_second": 443.19,
+    "accepted_per_second": 432.11,
+    "mean_request_ms": 12.347
+  },
+  "result": {
+    "fewer_429": 963,
+    "rejection_reduction_percent": 97.47
+  }
+}

@@ -1,106 +1,93 @@
-# PostgreSQL benchmark
+# Benchmark evidence
 
-## Result
+## PostgreSQL 16 request and task workload
 
-Benchmark timestamp: 2026-08-13 22:00:57 UTC.
+Benchmark timestamp: 2026-08-13 22:30:35 UTC.
 
-| Metric | Result |
+| Workload or result | Value |
 | --- | ---: |
-| privacy requests | 200 |
-| source tasks | 1,000 |
-| tenants | 20 |
-| request mix | 50% access, 50% deletion |
-| completed requests | 200 / 200 |
-| total task attempts | 1,000 |
-| request admission throughput | 65.47 requests/s |
-| request create p50 | 234.587 ms |
-| request create p95 | 692.618 ms |
-| request create p99 | 754.279 ms |
-| source-task throughput | 67.47 tasks/s |
-| source-task processing wall time | 14.8211 s |
-| idempotent replay throughput | 121.54 requests/s |
-| replayed request IDs matching | 200 / 200 |
-| additional attempts after replay | 0 |
-| valid tenant audit chains | 20 / 20 |
-
-The result is stored as
-[`benchmark-20260813T220057Z.json`](../benchmarks/benchmark_results/benchmark-20260813T220057Z.json).
-
-## Environment
-
-| Component | Value |
-| --- | --- |
-| operating system | Linux 5.15 x86_64 |
-| logical CPUs | 24 |
-| Python | 3.10.12 |
-| database | PostgreSQL 16 through asyncpg |
-| HTTP transport | HTTPX ASGITransport |
+| tenants | 100 |
+| privacy requests | 1,000 |
+| source tasks | 5,000 |
+| request mix | 50% Access, 50% Delete |
 | records per source | 4 |
-| request-create concurrency | 20 |
-| worker batch size | 64 |
+| create concurrency | 50 |
+| worker concurrency | 10 |
+| completed requests | 1,000 / 1,000 |
+| request admission throughput | 63.03 requests/s |
+| create P50 / P95 / P99 | 715.5 / 1,272.3 / 1,655.1 ms |
+| source-task throughput | 31.78 tasks/s |
+| total task attempts | 5,000 |
+| replayed IDs matching | 1,000 / 1,000 |
+| additional attempts after replay | 0 |
+| valid audit chains | 100 / 100 |
 
-ASGITransport sends HTTP requests directly into the application process. The
-measurements include FastAPI routing, Pydantic validation, application logic,
-SQLAlchemy and PostgreSQL. Network, reverse-proxy and TLS costs are outside the
-measured path.
+The result is stored in [`benchmark-20260813T223035Z.json`](../benchmarks/benchmark_results/benchmark-20260813T223035Z.json).
 
-## Reproduce
+Request admission includes FastAPI routing, Pydantic validation and the PostgreSQL transaction that inserts one request, five tasks, six Outbox rows and the first audit event. Source-task processing includes row-locked claim, data read or deletion, Delete readback, task receipt, parent aggregation, audit append and Access artifact generation. HTTPX ASGITransport removes socket, reverse-proxy and TLS overhead; the result isolates the Python and PostgreSQL path on 24 logical CPUs.
 
-Start PostgreSQL and create an empty database. The benchmark creates its own
-schema and synthetic device-cloud rows.
+The first 100-tenant run executed all tenant workers simultaneously and exhausted the default SQLAlchemy pool of 5 persistent plus 10 overflow connections. The corrected run sets a 10-connection pool, 20 overflow slots, a 10-second acquisition timeout and worker concurrency 10. It completed all 5,000 tasks with one attempt per task. This failure became the capacity rule used by the Helm worker configuration: task concurrency remains below the available database connection budget after reserving health, relay and status-update sessions.
+
+Reproduce:
 
 ```bash
 python benchmarks/run_benchmark.py \
-  --database-url postgresql+asyncpg://privacy:privacy@127.0.0.1:55432/privacy \
-  --requests 200 \
-  --concurrency 20 \
-  --tenants 20 \
-  --records-per-source 4 \
-  --worker-batch-size 64
+  --database-url postgresql+asyncpg://privacy:privacy@127.0.0.1:55433/privacy \
+  --requests 1000 --concurrency 50 --tenants 100 \
+  --records-per-source 4 --worker-batch-size 64 --worker-concurrency 10
 ```
 
-The workload performs these phases:
+## Worker termination and lease recovery
 
-1. Warm one request to load imports, compile SQL and establish connections.
-2. Seed each benchmark subject across five device-cloud sources.
-3. Create 200 tenant-scoped requests through the HTTP API.
-4. Alternate access and deletion request types.
-5. Run one worker pass per tenant in parallel. Each worker claims only that
-   tenant's tasks.
-6. Replay every creation command under its original idempotency key and compare
-   request IDs and task-attempt totals.
-7. Verify the audit chain for all 20 tenants.
-8. Query every parent request and write latency percentiles and outcomes to JSON.
+[`fault-injection-20260813T223347Z.json`](../benchmarks/benchmark_results/fault-injection-20260813T223347Z.json) claims five tasks under one worker, terminates the owner, expires the leases and lets a second worker reclaim them.
 
-## Reading the numbers
+| Result | Value |
+| --- | ---: |
+| initially claimed | 5 |
+| reclaimed after expiry | 5 |
+| recovered successfully | 5 |
+| final attempts per task | 2, 2, 2, 2, 2 |
+| request status | completed |
+| replay additional attempts | 0 |
+| audit-chain recomputation | passed |
 
-Request admission measures validation plus the transaction that inserts the
-request aggregate, five tasks, one Outbox event and the first audit event. The
-65.47 requests/s value represents that complete write path.
+## Cross-tenant isolation
 
-Task throughput covers claim, source query or deletion, deletion readback,
-receipt persistence, parent-state aggregation, audit append and access-artifact
-generation. Exactly 1,000 attempts for 1,000 tasks confirms that this run did
-not trigger lease recovery or task retry. The replay phase returned the same
-200 aggregate IDs without increasing task attempts, exercising the database
-idempotency constraint through the HTTP API.
+[`isolation-20260813T223338Z.json`](../benchmarks/benchmark_results/isolation-20260813T223338Z.json) creates one request for each of 100 tenants, performs 10,000 cross-tenant lookups at concurrency 25 and then executes one same-tenant control lookup per tenant.
 
-The processing call lasts much longer than request creation because one worker
-pass executes its claimed tasks sequentially inside each tenant. The next
-optimization experiment is bounded per-tenant task concurrency with separate
-database sessions, followed by comparison of lock waits, connection-pool wait
-and p99 task duration.
+| Result | Value |
+| --- | ---: |
+| cross-tenant HTTP 404 | 10,000 / 10,000 |
+| other cross-tenant responses | 0 |
+| same-tenant HTTP 200 | 100 / 100 |
+| probe throughput | 250.19 requests/s |
 
-## Additional experiments
+The lookup predicate combines request ID and tenant ID. The API returns the same absence response for an unknown resource and a resource owned by another tenant.
 
-Use the same JSON schema for follow-up runs:
+## SQS, S3/KMS and Redis integration
 
-- increase `--concurrency` while holding request count constant to locate the
-  database connection-pool knee;
-- increase tenants to measure parallel `SKIP LOCKED` claims across partitions;
-- force a worker exit after claim, wait for lease expiry and record recovered
-  task attempts;
-- run through Uvicorn and a reverse proxy to add socket, serialization and TLS
-  costs;
-- grow completed task history and compare claim-query plans with the active
-  status/lease/creation index.
+[`aws-adapters-20260813T224322Z.json`](../benchmarks/benchmark_results/aws-adapters-20260813T224322Z.json) uses boto3 and redis-py against LocalStack 3.8.1 and Redis 7.
+
+| Result | Value |
+| --- | ---: |
+| SQS published / received / acknowledged | 500 / 500 / 500 |
+| SQS publish / consume throughput | 202.94 / 146.46 messages/s |
+| visible and in-flight messages after run | 0 / 0 |
+| S3 artifacts uploaded | 100 |
+| objects carrying SSE-KMS | 100 / 100 |
+| objects carrying SHA-256 metadata | 100 / 100 |
+| presigned GET | generated with 300-second expiry |
+| Redis atomic AIMD updates | 1,000 |
+| Redis update throughput | 960.32 updates/s |
+| Redis distributed admission | 64 admitted, 65th blocked, one release allowed one new holder |
+
+## Regional connector overload
+
+[`connector-20260813T223245Z.json`](../benchmarks/benchmark_results/connector-20260813T223245Z.json) models a regional source accepting eight concurrent operations with 10 ms service time. Both policies receive the same 1,000 operations.
+
+| Policy | Accepted | HTTP 429 | Accepted throughput | Peak in flight |
+| --- | ---: | ---: | ---: | ---: |
+| fixed concurrency 32 | 12 | 988 | 28.53 operations/s | 32 |
+| AIMD, initial 4 | 975 | 25 | 432.11 operations/s | 9 |
+
+AIMD adds one slot after a successful latency window and halves the tenant/source window after an HTTP failure or P95 breach. The controlled overload run reduced first-attempt HTTP 429 responses by 97.47%. Redis Lua updates make the window decision atomic across worker Pods and expire inactive tenant/source keys after the configured TTL.

@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "timestamp_utc": "2026-08-13T22:30:35.902594+00:00",
+  "environment": {
+    "python": "3.10.12",
+    "platform": "Linux-5.15.0-186-generic-x86_64-with-glibc2.35",
+    "processor": "x86_64",
+    "logical_cpus": 24,
+    "database": "PostgreSQL (asyncpg)",
+    "transport": "HTTPX ASGITransport (no network or TLS overhead)"
+  },
+  "workload": {
+    "requests": 1000,
+    "sources_per_request": 5,
+    "source_tasks": 5000,
+    "records_per_source": 4,
+    "create_concurrency": 50,
+    "tenants": 100,
+    "worker_batch_size": 64,
+    "worker_concurrency": 10,
+    "request_mix": "50% access, 50% delete"
+  },
+  "seed": {
+    "mean_ms": 463.016,
+    "p50_ms": 435.532,
+    "p95_ms": 910.376,
+    "p99_ms": 1234.982,
+    "max_ms": 1282.295,
+    "wall_seconds": 9.5451,
+    "operations_per_second": 104.77
+  },
+  "create": {
+    "mean_ms": 777.454,
+    "p50_ms": 715.49,
+    "p95_ms": 1272.317,
+    "p99_ms": 1655.112,
+    "max_ms": 1965.675,
+    "wall_seconds": 15.8656,
+    "requests_per_second": 63.03
+  },
+  "process": {
+    "mean_ms": 14804.144,
+    "p50_ms": 14152.769,
+    "p95_ms": 20423.8,
+    "p99_ms": 21082.759,
+    "max_ms": 21148.353,
+    "wall_seconds": 157.3254,
+    "source_tasks_per_second": 31.78,
+    "processing_passes": 1,
+    "total_task_attempts": 5000
+  },
+  "idempotent_replay": {
+    "mean_ms": 279.763,
+    "p50_ms": 242.495,
+    "p95_ms": 418.857,
+    "p99_ms": 907.799,
+    "max_ms": 930.549,
+    "wall_seconds": 5.7953,
+    "requests_per_second": 172.55,
+    "matching_request_ids": 1000,
+    "additional_task_attempts": 0
+  },
+  "result": {
+    "terminal_requests": 1000,
+    "status_counts": {
+      "completed": 1000
+    },
+    "valid_audit_chains": 100,
+    "audited_tenants": 100
+  }
+}

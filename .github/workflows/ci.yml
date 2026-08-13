@@ -32,3 +32,20 @@ jobs:
           tags: fleetprivacy:test
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  infrastructure:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.14.4"
+      - uses: azure/setup-helm@v4
+        with:
+          version: "v3.16.4"
+      - run: terraform -chdir=infra/aws fmt -check -recursive
+      - run: terraform -chdir=infra/aws init -backend=false -input=false
+      - run: terraform -chdir=infra/aws validate
+      - run: helm lint deploy/aws
+      - run: helm template fleetprivacy deploy/aws > /tmp/fleetprivacy.yaml
+      - run: docker compose -f compose.aws-test.yml config > /tmp/compose.yaml

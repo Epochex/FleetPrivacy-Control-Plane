@@ -1,66 +1,131 @@
-# 面试深挖手册
+# 汉朔联网设备隐私云服务面试深挖
 
-这个项目用于回答 Python 云服务后端场景题。讲解主线固定为：请求如何进入，数据库保存什么，并发时谁做决定，进程退出后如何恢复，结果如何验证。
+## 60 秒项目介绍
 
-## 30 秒项目介绍
+我在汉朔设备交付场景中接触到门店 AP、电子价签、心跳遥测、刷新任务和支持日志分散在区域服务里的问题。以零售商为租户、门店为资源域，我用 Python 和 FastAPI 构建了隐私 Access 与 Delete 云服务，将一次请求拆成账户、设备绑定、遥测、任务历史和支持日志五路任务。
 
-我实现了一个面向联网设备云的多租户隐私请求控制面。用户数据分布在账户、设备绑定、遥测、任务历史和支持日志中，服务将一次访问或删除请求拆成多个数据源任务。API 使用 FastAPI 和异步 SQLAlchemy，PostgreSQL 同时保存请求状态、任务租约、Outbox 事件和哈希链审计记录。客户端重复提交由租户级幂等键收敛，worker 退出后由过期租约重新领取任务，最终返回每个数据源的处理回执和汇总状态。
+请求、任务、Outbox 和首条审计事件在 RDS PostgreSQL 同一事务提交。Outbox relay 将任务投递到 SQS，EKS worker 通过数据库租约决定执行资格，并同时延长 SQS visibility 与数据库 lease。区域连接器把成功率、HTTP 429 和 P95 延迟写入 Redis，Lua 脚本按租户和数据源原子更新 AIMD 并发窗口。Access 制品进入 S3，使用 KMS 加密和 SHA-256 metadata，API 返回五分钟下载链接；Delete 完成后反向查询剩余记录。PostgreSQL 16 的 100 租户基准完成 1000 个请求和 5000 个任务，1000 次幂等重放增加 0 次执行，100 条审计链全部通过重算。
 
-## 为什么用 PostgreSQL 协调任务
+## 需求如何从汉朔业务产生
 
-这个项目的任务与业务状态存在强事务关系。创建隐私请求时，请求行、各数据源任务、审计事件和 Outbox 事件需要一起提交。PostgreSQL 可以在一个事务内建立这些记录，并通过行锁和租约完成多 worker 竞争。
+汉朔设备侧已经存在两类真实工程入口：
 
-继续追问时讲三个点：
+1. AP 发现与配网工具扫描门店网段，写入 DHCP、网关、DNS、业务地址、端口、TLS 和自动发现参数，再通过 SSH 回读确认，单设备接入由约 5 分钟压缩到 40 秒。
+2. 区域 API 采集工具分页读取门店、ESL 标识、最后心跳、电量、固件版本、刷新与闪灯次数、屏幕尺寸和产品型号。
 
-1. 请求吞吐量处于数据库任务队列适合承载的范围，减少了独立消息基础设施。
-2. 领取查询需要命中 `(status, lease_expires_at, created_at)` 索引，并限制批量大小。
-3. 当任务量持续上升时，Outbox publisher 可以接入消息系统，PostgreSQL 继续保存最终任务状态和幂等记录。
+隐私请求沿着同一数据域展开。一个账户标识会关联设备绑定、心跳和电量事件、刷新与升级任务、支持诊断日志。删除请求必须给出每个数据源的执行回执和剩余记录数，Access 请求必须生成可交付、可校验、可过期的制品。零售商之间数据隔离，门店与区域服务存在不同吞吐上限，Worker 与区域网络都可能中断。
 
-## 幂等如何处理并发重复请求
+## 一次请求如何执行
 
-客户端携带 `Idempotency-Key`，数据库对 `(tenant_id, idempotency_key)` 建立唯一约束。两个请求同时到达时，应用层预查只能减少普通重复，唯一约束负责处理竞态。冲突事务回滚后查询原请求并返回同一个 request ID。
+### 1. 接口受理
 
-面试官可能继续问：请求体不同但幂等键相同怎么办。生产扩展可以保存规范化请求体哈希，相同键加相同哈希返回旧结果，相同键加不同哈希返回 `409 Conflict`。
+客户端提交租户、API key、`Idempotency-Key`、请求类型、身份标识和数据源列表。Pydantic 完成字段与枚举校验，身份标识归一化后保存 SHA-256 key。数据库唯一约束为 `(tenant_id, idempotency_key)`；应用层预查处理普通重放，唯一约束处理并发竞态，相同命令返回原 request ID，不同命令返回 HTTP 409。
 
-## worker 在哪里可能重复执行
+### 2. 原子创建任务
 
-worker 完成数据源操作后、写回任务回执前退出，会让租约到期后再次执行。数据源适配器因此使用 `(request_id, source)` 作为操作键，删除采用可重复执行的状态更新，访问采用确定性查询和可重建制品。任务处理语义是至少一次领取加幂等副作用。
+同一事务插入：
 
-## 为什么租约比单个 running 状态可靠
+- 一条 request；
+- 五条 source task；
+- 五条 `privacy_task.ready` Outbox 事件；
+- 一条 request-created Outbox 事件；
+- 一条审计事件。
 
-单个 `running` 状态无法判断 owner 是否仍在执行。租约额外记录 owner 和过期时间。当前数据源任务执行完成后清空租约，进程退出后，数据库时间超过 `lease_expires_at`，其他 worker 可以领取。租约时长需要高于单次数据源操作的超时；长任务可以增加心跳续租。领取语句在事务中锁定候选任务，从而避免双重 owner。
+提交成功后，请求真相和待投递事件同时存在。API 在提交后发生连接中断时，客户端使用原幂等键取得同一 request ID。
+
+### 3. Outbox 投递
+
+多个 relay 使用 `FOR UPDATE SKIP LOCKED` 批量领取未发布行。SQS 确认消息后写入 `published_at`。relay 在发送后、数据库提交前退出会产生重复消息，消费端使用 task row 吸收重复。
+
+### 4. Worker 领取与续租
+
+消息只提供唤醒信号，PostgreSQL 任务行决定执行资格。原子更新检查 task ID、pending 状态或过期 lease，成功后写 owner、lease、attempt。处理期间每 60 秒延长 SQS visibility，数据库 lease 延长到 240 秒。Worker 失联后消息重新可见，lease 到期，另一个 Worker 领取并继续。
+
+### 5. 区域数据源调用
+
+连接器使用 HTTPS 与 Secrets Manager 服务令牌，发送租户 ID、request ID、`task_id:source` 幂等键和 subject hash。每个租户与区域数据源拥有独立 AIMD 窗口。健康窗口加 1，HTTP 429、失败或 P95 超过阈值时按比例减小。Redis Lua 在一条命令中读取、计算和保存窗口，并设置 TTL；多个 EKS Worker Pod 共享同一压力状态。
+
+### 6. 结果核验
+
+Access 汇总五路回执，按确定性对象键写入 S3。对象携带 SSE-KMS 和内容 SHA-256，API 返回 300 秒 presigned GET。Delete 对租户、subject hash 和 source 三个条件执行删除，再用相同条件查询活动记录；剩余记录数大于 0 时保存失败回执。
+
+## 为什么同时用 PostgreSQL 和 SQS
+
+PostgreSQL保存业务真相：请求状态、幂等键、任务租约、执行次数、回执和审计链。SQS保存投递状态：消息可见性、接收次数和 DLQ。两者通过 Outbox 连接。
+
+只用 SQS 难以在创建请求时原子提交五个任务和审计证据，也难以让 API 精确查询每个数据源的执行状态。只轮询 PostgreSQL 会让大量 Worker 持续扫描任务索引。当前设计让 SQS负责唤醒与削峰，数据库行负责幂等执行和状态收敛。
+
+## 消息在哪些位置会重复
+
+三个窗口会产生重复：
+
+1. relay 已发送 SQS，尚未写 `published_at`；
+2. Worker 已完成数据源副作用，尚未写任务回执；
+3. Worker 已写回执，尚未确认 SQS 消息。
+
+数据库任务终态处理第 1 和第 3 个窗口。区域 API 使用 task/source 幂等键处理第 2 个窗口。Delete 使用可重入操作并执行 readback；Access 使用确定性读取和确定性 S3 对象键。重复消息命中 terminal task 时不增加 attempt，同时刷新父请求和缺失制品。
+
+## 为什么 lease 和 visibility 都要续
+
+SQS visibility 防止同一消息在长任务期间被另一个 Consumer 收到。数据库 lease 防止不同消息副本或人工重放同时获得任务执行权。两个时钟解决不同竞争面。
+
+设置关系为：区域调用超时小于 heartbeat 周期，heartbeat 周期小于数据库 lease，数据库 lease 小于或接近 SQS visibility。生产配置采用 60 秒 heartbeat、240 秒数据库 lease、300 秒 visibility。Worker 每次心跳同时续两个状态。
+
+## Redis AIMD 如何回答追问
+
+固定并发适合容量稳定的单一区域服务。门店规模、区域网络和上游 API 限流会改变可接受并发。AIMD 使用直接反馈调节窗口：
+
+```text
+success and P95 <= target: cwnd = min(max, cwnd + 1)
+failure or P95 > target:    cwnd = max(min, floor(cwnd * 0.5))
+```
+
+Redis key 为 `privacy:aimd:{tenant}:{source}`，另以 sorted set 保存 active task 与准入 lease 到期时间。准入 Lua 先清理过期 holder，再比较集合基数与窗口；窗口 Lua 原子读取当前值并写下一值，避免两个 Pod 同时基于旧值放大。TTL清理长时间没有流量的组合。窗口为 64 时的集成实验准入前 64 个 holder、阻断第 65 个，释放 1 个后立即允许新 holder。1000 操作的受控容量实验中，上游容量为 8，固定并发 32 产生 988 次首轮 429，AIMD 产生 25 次，下降 97.47%；成功吞吐从 28.53 提升至 432.11 operations/s。
+
+## 数据库连接池故障如何回答
+
+第一次将 100 个租户 Worker 全部并发执行时，SQLAlchemy 默认连接池只有 5 个常驻连接和 10 个 overflow，30 秒后出现 pool timeout。根因是 Worker 批次并发直接由租户数决定，超过数据库会话预算。
+
+修复包含三项：
+
+1. 显式配置 pool size 10、max overflow 20 和 10 秒获取超时；
+2. 基准与 Worker 将并发限制为 10，为 Outbox relay、健康检查和父状态更新保留连接；
+3. CloudWatch 结合 RDS 连接数、CPU、锁等待和 SQS oldest message 判断扩 Pod、扩数据库或优化查询。
+
+修正后的 100 租户、1000 请求、5000 任务全部完成，任务尝试数保持 5000。
 
 ## 多租户隔离落在哪里
 
-隔离不是 API Header 上的装饰字段。`tenant_id` 被写入请求、任务、数据记录、Outbox 和审计记录，读写 SQL 同时过滤资源 ID 与租户 ID。相同 subject hash 和相同幂等键可以安全存在于不同租户。测试使用两个租户交叉查询同一资源，验证返回 404 或空结果。
+租户标识进入 request、task、source record、Outbox 和 audit event。外部资源查询同时过滤 resource ID 与 tenant ID，幂等唯一约束包含 tenant ID，S3 对象键按 tenant 分层，Redis AIMD key 也包含 tenant。隔离基准执行 10000 次跨租户请求，全部返回 404；100 次同租户控制查询全部返回 200。
 
-## 为什么保存 subject hash
+## 审计链如何阻断并发分叉
 
-原始邮箱或账户 ID 只用于请求处理入口，归一化后计算 SHA-256。各数据源演示表与任务表通过 hash 匹配，日志和审计只记录 hash。这样可以降低控制面数据库和日志携带直接身份标识的范围。生产系统可以进一步使用租户级 HMAC，降低低熵标识被离线枚举的风险。
+每个租户使用单调 sequence。写入前获取 PostgreSQL advisory transaction lock，读取当前链头，再计算 payload hash、previous hash 和 event hash。`(tenant_id, sequence)` 唯一约束提供第二道并发约束。验证器按 sequence 从头重算，能够定位载荷修改、乱序和内部删除。100 个租户的链全部通过完整重算。
 
-## 审计哈希链能证明什么
+## S3 制品失败如何恢复
 
-每条事件包含序号、上一条哈希、动作、规范化 payload 哈希和当前事件哈希。验证器从头重算，可以定位被修改、删除或乱序的第一条记录。它提供篡改检测，审计库的访问控制、备份和外部时间戳仍由部署体系负责。
+Access 最后一条任务回执提交后，聚合器写 S3 并将 URI 写回 request。S3 调用失败时，任务终态仍在数据库中，SQS 消息保留。重复消息命中 terminal task 后检查 `artifact_path`，缺失时重新聚合并覆盖同一确定性对象键，再写回 URI 并确认消息。LocalStack 集成验证上传 100 个对象，100 个均带 `aws:kms` 属性和 64 位 SHA-256 metadata。
 
-## Outbox 解决什么故障
+## AWS 资源如何支撑生产
 
-如果代码先提交数据库再发消息，进程可能在两步之间退出；先发消息再提交数据库会产生消费者看见消息但查不到状态的问题。Outbox 将业务状态和待发布事件放进同一事务。publisher 按 `published_at IS NULL` 查询，发布成功后回写时间。消费者按 event ID 去重。
+- EKS 分离 API 与 Worker Deployment，各自使用 Pod Identity；HPA、PDB、拓扑分散和滚动发布控制容量与中断。
+- RDS PostgreSQL 16 Multi-AZ 保存业务状态，开启 TLS、备份、Performance Insights 和存储自动扩容。
+- ElastiCache Redis 一主两副本，TLS、AUTH、KMS、自动故障转移和 7 天快照保存共享 AIMD 状态。
+- SQS主队列使用长轮询、visibility heartbeat 和五次接收 DLQ；修复依赖后按 event ID redrive。
+- S3开启公共访问阻断、SSE-KMS、versioning 和生命周期；KMS、Secrets Manager 与 CSI 管理数据密钥和连接凭据。
+- CloudWatch 对 RDS CPU/存储、Redis CPU/eviction、SQS oldest message 和 DLQ visible message 建立告警。
 
-## `partial` 状态如何处理
+## Benchmark 报数顺序
 
-隐私请求覆盖多个独立数据源，一处短暂故障不应抹掉其他来源已经完成的回执。父请求汇总每个 task 的状态，保存成功结果和失败原因。操作人员能够看到完成范围、失败数据源和尝试次数。后续重试接口可以将指定失败 task 重置为 pending，同时保留之前的审计事件。
+先给负载，再给结果：PostgreSQL 16，100 租户，50 个创建客户端，10 个 Worker 并发，1000 请求，每个请求 5 个任务，共 5000 个任务，Access 与 Delete 各占一半。
 
-## Benchmark 应该怎么讲
+- 创建吞吐 63.03 requests/s，P50 715.5 ms，P95 1.272 s，P99 1.655 s。
+- 任务处理 31.78 tasks/s，1000/1000 请求完成。
+- 1000 次幂等回放全部返回原 ID，新增 attempt 为 0。
+- 100/100 租户审计链通过重算。
+- Worker 退出演练中 5/5 任务租约到期后被重新领取并完成。
+- 500 条 SQS 消息全部确认，队列残留 0；100/100 S3 对象通过 KMS 与摘要检查。
 
-先说明负载模型，再报数字：多少租户、多少请求、每个请求多少 source、并发客户端数、数据库版本和硬件。结果分成两组：HTTP admission 只测校验加事务创建，端到端测试包含任务领取、数据源处理、汇总与制品生成。报告 p50/p95/p99、吞吐、完成率、重试数和幂等回放一致性。
+## 个人承担
 
-单个平均值无法解释尾延迟。遇到 p99 上升时，先对照数据库连接池等待、领取批次、锁等待和每个 source 的直方图。
-
-## 可以继续演进的方向
-
-- 任务表按完成时间归档，控制活跃索引体积。
-- 使用 HMAC subject token 和密钥版本支持租户级轮换。
-- 将制品写入对象存储并返回短期签名 URL。
-- 为请求体保存哈希，完善幂等键冲突语义。
-- Outbox 接入 Kafka 或云消息服务，消费者按 event ID 去重。
-- 使用 OpenTelemetry 关联 API 请求、任务领取、数据源调用和回执提交。
+我负责需求拆解、数据模型、FastAPI 接口、事务边界、任务租约、Outbox、SQS 消费、Redis AIMD、S3/KMS 制品、审计链、Terraform、Helm、测试与基准。AP 配网和区域设备采集来自汉朔实习的实际设备域，隐私请求服务把这些数据源组织成可恢复的统一云服务。

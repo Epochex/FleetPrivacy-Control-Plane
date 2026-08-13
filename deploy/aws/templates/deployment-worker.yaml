@@ -1,0 +1,94 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fleetprivacy-worker
+  labels:
+    app.kubernetes.io/name: fleetprivacy
+    app.kubernetes.io/component: worker
+spec:
+  replicas: {{ .Values.workerReplicas }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: fleetprivacy
+      app.kubernetes.io/component: worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: fleetprivacy
+        app.kubernetes.io/component: worker
+    spec:
+      serviceAccountName: fleetprivacy-worker
+      terminationGracePeriodSeconds: 90
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: fleetprivacy
+              app.kubernetes.io/component: worker
+      containers:
+        - name: worker
+          image: {{ .Values.image | quote }}
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "privacy_cloud.services.queue_worker"]
+          envFrom:
+            - configMapRef:
+                name: fleetprivacy-aws
+          env:
+            - name: PRIVACY_CLOUD_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: fleetprivacy-application
+                  key: database-url
+            - name: PRIVACY_CLOUD_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: fleetprivacy-application
+                  key: api-key
+            - name: PRIVACY_CLOUD_REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: fleetprivacy-application
+                  key: redis-url
+            - name: PRIVACY_CLOUD_WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: fleetprivacy-application
+                  key: webhook-secret
+            - name: PRIVACY_CLOUD_REGIONAL_SOURCE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: fleetprivacy-application
+                  key: regional-source-token
+          resources:
+{{ toYaml .Values.resources.worker | indent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: aws-secret
+              mountPath: /mnt/secrets-store
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: aws-secret
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: fleetprivacy-application
+        - name: tmp
+          emptyDir: {}

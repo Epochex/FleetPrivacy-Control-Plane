@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import json
 import time
 from datetime import timedelta
-from pathlib import Path
 from typing import Any
 
 from sqlalchemy import and_, func, or_, select, update
@@ -21,7 +19,9 @@ from privacy_cloud.models import (
     TaskStatus,
     utcnow,
 )
+from privacy_cloud.services.artifacts import ArtifactStore, build_artifact_store
 from privacy_cloud.services.events import append_audit, enqueue_outbox
+from privacy_cloud.services.source_connectors import RegionalSourceExecutor, SourceOperation
 
 
 def _claimable(now: Any) -> Any:
@@ -151,11 +151,13 @@ async def _execute_delete(session: AsyncSession, task: RequestTask) -> dict[str,
     return {"deleted_count": len(rows), "remaining_count": 0, "verified": True}
 
 
-async def _write_artifact(session: AsyncSession, request: PrivacyRequest) -> str:
+async def _write_artifact(
+    session: AsyncSession,
+    request: PrivacyRequest,
+    artifact_store: ArtifactStore | None = None,
+) -> str:
     settings = get_settings()
-    artifact_dir = Path(settings.artifact_dir) / request.tenant_id
-    artifact_dir.mkdir(parents=True, exist_ok=True)
-    path = artifact_dir / f"{request.id}.json"
+    artifact_store = artifact_store or build_artifact_store(settings)
     document = {
         "request_id": request.id,
         "tenant_id": request.tenant_id,
@@ -164,13 +166,20 @@ async def _write_artifact(session: AsyncSession, request: PrivacyRequest) -> str
         "sources": {task.source: task.result_summary for task in request.tasks},
         "generated_at": utcnow().isoformat(),
     }
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(document, ensure_ascii=False, sort_keys=True), encoding="utf-8")
-    temporary.replace(path)
-    return str(path)
+    reference = await artifact_store.put_json(
+        tenant_id=request.tenant_id,
+        request_id=request.id,
+        document=document,
+    )
+    return reference.uri
 
 
-async def refresh_request_status(session: AsyncSession, request_id: str) -> RequestStatus:
+async def refresh_request_status(
+    session: AsyncSession,
+    request_id: str,
+    *,
+    artifact_store: ArtifactStore | None = None,
+) -> RequestStatus:
     request = (
         await session.execute(
             select(PrivacyRequest)
@@ -192,7 +201,8 @@ async def refresh_request_status(session: AsyncSession, request_id: str) -> Requ
     else:
         status = RequestStatus.PARTIAL
     request.status = status
-    request.version += 1
+    if status != previous_status:
+        request.version += 1
 
     became_terminal = status in {
         RequestStatus.COMPLETED,
@@ -203,12 +213,18 @@ async def refresh_request_status(session: AsyncSession, request_id: str) -> Requ
         RequestStatus.PARTIAL,
         RequestStatus.FAILED,
     }
+    needs_access_artifact = (
+        request.kind == RequestKind.ACCESS
+        and status in {RequestStatus.COMPLETED, RequestStatus.PARTIAL}
+        and request.artifact_path is None
+    )
+    if needs_access_artifact:
+        request.artifact_path = await _write_artifact(
+            session,
+            request,
+            artifact_store=artifact_store,
+        )
     if became_terminal:
-        if request.kind == RequestKind.ACCESS and status in {
-            RequestStatus.COMPLETED,
-            RequestStatus.PARTIAL,
-        }:
-            request.artifact_path = await _write_artifact(session, request)
         summary = {
             "status": status.value,
             "succeeded": sum(task.status == TaskStatus.SUCCEEDED for task in request.tasks),
@@ -233,7 +249,13 @@ async def refresh_request_status(session: AsyncSession, request_id: str) -> Requ
     return status
 
 
-async def execute_task(session: AsyncSession, *, task_id: str, worker_id: str) -> bool:
+async def execute_task(
+    session: AsyncSession,
+    *,
+    task_id: str,
+    worker_id: str,
+    source_executor: RegionalSourceExecutor | None = None,
+) -> bool:
     task = (
         await session.execute(
             select(RequestTask)
@@ -250,7 +272,22 @@ async def execute_task(session: AsyncSession, *, task_id: str, worker_id: str) -
 
     started = time.perf_counter()
     try:
-        if task.request.kind == RequestKind.ACCESS:
+        if source_executor is not None:
+            if task.request.kind == RequestKind.DELETE:
+                task.request.status = RequestStatus.VERIFYING
+            receipt = await source_executor.execute(
+                SourceOperation(
+                    task_id=task.id,
+                    tenant_id=task.tenant_id,
+                    source=task.source,
+                    subject_key_hash=task.request.subject_key_hash,
+                    kind=task.request.kind.value,
+                )
+            )
+            if not receipt.succeeded:
+                raise RuntimeError(f"regional source returned HTTP {receipt.status_code}")
+            result = receipt.payload
+        elif task.request.kind == RequestKind.ACCESS:
             result = await _execute_access(session, task)
         else:
             task.request.status = RequestStatus.VERIFYING
@@ -259,7 +296,12 @@ async def execute_task(session: AsyncSession, *, task_id: str, worker_id: str) -
         task.status = TaskStatus.SUCCEEDED
         task.error = None
     except Exception as exc:  # noqa: BLE001 - task failures are persisted as workflow state
-        task.status = TaskStatus.FAILED
+        settings = get_settings()
+        task.status = (
+            TaskStatus.PENDING
+            if source_executor is not None and task.attempt < settings.max_task_attempts
+            else TaskStatus.FAILED
+        )
         task.error = str(exc)[:2000]
     finally:
         task.lease_owner = None
@@ -271,7 +313,11 @@ async def execute_task(session: AsyncSession, *, task_id: str, worker_id: str) -
             session,
             tenant_id=task.tenant_id,
             request_id=task.request_id,
-            action=f"task.{task.status.value}",
+            action=(
+                "task.retry_scheduled"
+                if task.status == TaskStatus.PENDING
+                else f"task.{task.status.value}"
+            ),
             payload={"source": task.source, "attempt": task.attempt, "error": task.error},
         )
         await session.commit()

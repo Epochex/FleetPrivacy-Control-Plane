@@ -72,6 +72,18 @@ async def create_privacy_request(
             event_type="privacy_request.created",
             payload={"kind": request.kind.value, "sources": request.requested_sources},
         )
+        for task in request.tasks:
+            enqueue_outbox(
+                session,
+                tenant_id=tenant_id,
+                aggregate_id=task.id,
+                event_type="privacy_task.ready",
+                payload={
+                    "task_id": task.id,
+                    "request_id": request.id,
+                    "source": task.source,
+                },
+            )
         await append_audit(
             session,
             tenant_id=tenant_id,
