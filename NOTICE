@@ -1,0 +1,25 @@
+FleetPrivacy Control Plane
+Copyright (c) 2026 Epochex
+
+Design references
+=================
+
+This project draws engineering ideas from the following open-source projects
+and public architectures:
+
+1. Full Stack FastAPI Template
+   https://github.com/fastapi/full-stack-fastapi-template
+   Copyright (c) 2017 Sebastián Ramírez
+   MIT License
+
+2. Fides
+   https://github.com/ethyca/fides
+   Copyright Ethyca, Inc.
+   Apache License 2.0
+
+3. Amazon S3 Find and Forget
+   https://github.com/awslabs/amazon-s3-find-and-forget
+   Copyright Amazon.com, Inc. or its affiliates
+   Apache License 2.0
+
+The respective project names and trademarks belong to their owners.

@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+.ruff_cache/
+.pytest_cache/
+*.pyc
+*.db
+artifacts/
+benchmark_results/*.json
+.env

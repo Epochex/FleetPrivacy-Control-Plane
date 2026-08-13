@@ -1,0 +1,95 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: fleetprivacy-artifacts
+  namespace: fleetprivacy
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fleetprivacy
+  namespace: fleetprivacy
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: fleetprivacy
+  template:
+    metadata:
+      labels:
+        app: fleetprivacy
+    spec:
+      securityContext:
+        runAsNonRoot: true
+      containers:
+        - name: api
+          image: ghcr.io/epochex/fleetprivacy-control-plane:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            - name: PRIVACY_CLOUD_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: fleetprivacy-secrets
+                  key: database-url
+            - name: PRIVACY_CLOUD_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: fleetprivacy-secrets
+                  key: api-key
+            - name: PRIVACY_CLOUD_ARTIFACT_DIR
+              value: /var/lib/fleetprivacy/artifacts
+          readinessProbe:
+            httpGet:
+              path: /v1/healthz
+              port: http
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /v1/healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: artifacts
+              mountPath: /var/lib/fleetprivacy/artifacts
+      volumes:
+        - name: artifacts
+          persistentVolumeClaim:
+            claimName: fleetprivacy-artifacts
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fleetprivacy
+  namespace: fleetprivacy
+spec:
+  selector:
+    app: fleetprivacy
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
